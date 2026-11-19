@@ -28,7 +28,7 @@ const ai = new GoogleGenAI({
 });
 
 const PRIMARY_MODEL = 'gemini-2.5-flash';
-const FALLBACK_MODEL = 'gemini-2.0-flash';
+const FALLBACK_MODEL = 'gemini-3.8-flash';
 
 function formatElapsedTimestamp(seconds: number): string {
   const safe = Math.max(0, Math.floor(seconds || 0));
