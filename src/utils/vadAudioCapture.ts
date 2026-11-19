@@ -1,6 +1,7 @@
 export type VadStatus = 'idle' | 'monitoring' | 'speech';
 
 export interface VadSegmentPayload {
+  pcm16: Int16Array;
   audioBase64: string;
   tailAudioBase64: string;
   durationMs: number;
@@ -16,9 +17,9 @@ export interface VadCaptureCallbacks {
 
 const TARGET_SAMPLE_RATE = 16000;
 const PRE_SPEECH_MS = 450;
-const HANGOVER_MS = 850;
-const MIN_SPEECH_MS = 350;
-const MAX_SEGMENT_MS = 12000;
+const SILENCE_DURATION_MS = 1500;
+const MIN_SPEECH_DURATION_MS = 900;
+const MAX_UTTERANCE_MS = 12000;
 const OVERLAP_TAIL_MS = 950;
 
 const WORKLET_CODE = `
@@ -70,8 +71,28 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-export function encodeWav16kMonoBase64(samples: Float32Array): string {
-  const numSamples = samples.length;
+export function float32ToInt16(samples: Float32Array): Int16Array {
+  const pcm16 = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    pcm16[i] = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
+  }
+  return pcm16;
+}
+
+export function concatInt16Arrays(arrays: Int16Array[]): Int16Array {
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const merged = new Int16Array(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    merged.set(arr, offset);
+    offset += arr.length;
+  }
+  return merged;
+}
+
+export function encodePcm16ToWavBase64(pcm16: Int16Array): string {
+  const numSamples = pcm16.length;
   const dataBytes = numSamples * 2;
   const buffer = new ArrayBuffer(44 + dataBytes);
   const view = new DataView(buffer);
@@ -103,13 +124,15 @@ export function encodeWav16kMonoBase64(samples: Float32Array): string {
 
   let offset = 44;
   for (let i = 0; i < numSamples; i++) {
-    const clamped = Math.max(-1, Math.min(1, samples[i]));
-    const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-    view.setInt16(offset, int16, true);
+    view.setInt16(offset, pcm16[i], true);
     offset += 2;
   }
 
   return arrayBufferToBase64(buffer);
+}
+
+export function encodeWav16kMonoBase64(samples: Float32Array): string {
+  return encodePcm16ToWavBase64(float32ToInt16(samples));
 }
 
 export class VadAudioCapture {
@@ -289,12 +312,11 @@ export class VadAudioCapture {
     const isVoiceFrame = rms >= speechThreshold;
 
     const preSpeechMaxSamples = Math.floor((PRE_SPEECH_MS / 1000) * TARGET_SAMPLE_RATE);
-    const hangoverMaxSamples = Math.floor((HANGOVER_MS / 1000) * TARGET_SAMPLE_RATE);
-    const maxSegmentSamples = Math.floor((MAX_SEGMENT_MS / 1000) * TARGET_SAMPLE_RATE);
+    const silenceMaxSamples = Math.floor((SILENCE_DURATION_MS / 1000) * TARGET_SAMPLE_RATE);
+    const maxUtteranceSamples = Math.floor((MAX_UTTERANCE_MS / 1000) * TARGET_SAMPLE_RATE);
 
     if (this.currentVadStatus !== 'speech') {
       if (isVoiceFrame) {
-        // Transition from monitoring -> speech; prepend pre-speech ring buffer so onset isn't clipped
         this.speechStartElapsedSec = Math.max(0, (now - this.sessionStartMs - PRE_SPEECH_MS) / 1000);
         this.activeChunks = [];
         this.activeSampleCount = 0;
@@ -308,9 +330,7 @@ export class VadAudioCapture {
         this.trailingSilenceSamples = 0;
         this.setVadStatus('speech');
       } else {
-        // Update adaptive background noise floor gently while silent
         this.noiseFloor = this.noiseFloor * 0.96 + rms * 0.04;
-        // Maintain rolling pre-speech buffer
         const combined = new Float32Array(this.preSpeechRing.length + samples16k.length);
         combined.set(this.preSpeechRing, 0);
         combined.set(samples16k, this.preSpeechRing.length);
@@ -333,16 +353,16 @@ export class VadAudioCapture {
       this.trailingSilenceSamples += samples16k.length;
     }
 
-    if (this.trailingSilenceSamples >= hangoverMaxSamples || this.activeSampleCount >= maxSegmentSamples) {
+    if (this.trailingSilenceSamples >= silenceMaxSamples || this.activeSampleCount >= maxUtteranceSamples) {
       this.flushSpeechSegment();
       this.setVadStatus('monitoring');
     }
   }
 
   private flushSpeechSegment(): void {
-    const minSamples = Math.floor((MIN_SPEECH_MS / 1000) * TARGET_SAMPLE_RATE);
-    // Exclude excess trailing silence beyond 200ms padding
-    const keepPaddingSamples = Math.floor(0.2 * TARGET_SAMPLE_RATE);
+    const minSamples = Math.floor((MIN_SPEECH_DURATION_MS / 1000) * TARGET_SAMPLE_RATE);
+    // Exclude excess trailing silence beyond 250ms padding
+    const keepPaddingSamples = Math.floor(0.25 * TARGET_SAMPLE_RATE);
     const trimSamples = Math.max(0, this.trailingSilenceSamples - keepPaddingSamples);
     const usableSamples = this.activeSampleCount - trimSamples;
 
@@ -366,14 +386,16 @@ export class VadAudioCapture {
     this.activeSampleCount = 0;
     this.trailingSilenceSamples = 0;
 
-    const tailSamplesCount = Math.min(merged.length, Math.floor((OVERLAP_TAIL_MS / 1000) * TARGET_SAMPLE_RATE));
-    const tailSlice = merged.slice(merged.length - tailSamplesCount);
+    const pcm16 = float32ToInt16(merged);
+    const tailSamplesCount = Math.min(pcm16.length, Math.floor((OVERLAP_TAIL_MS / 1000) * TARGET_SAMPLE_RATE));
+    const tailPcm16 = pcm16.slice(pcm16.length - tailSamplesCount);
 
-    const audioBase64 = encodeWav16kMonoBase64(merged);
-    const tailAudioBase64 = encodeWav16kMonoBase64(tailSlice);
-    const durationMs = Math.round((merged.length / TARGET_SAMPLE_RATE) * 1000);
+    const audioBase64 = encodePcm16ToWavBase64(pcm16);
+    const tailAudioBase64 = encodePcm16ToWavBase64(tailPcm16);
+    const durationMs = Math.round((pcm16.length / TARGET_SAMPLE_RATE) * 1000);
 
     this.callbacks.onSpeechSegment({
+      pcm16,
       audioBase64,
       tailAudioBase64,
       durationMs,

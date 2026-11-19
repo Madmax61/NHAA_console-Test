@@ -1,7 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import { LocationConfidenceMap } from './LocationConfidenceMap';
-import { VadAudioCapture, VadStatus, VadSegmentPayload } from './utils/vadAudioCapture';
+import {
+  VadAudioCapture,
+  VadStatus,
+  VadSegmentPayload,
+  concatInt16Arrays,
+  encodePcm16ToWavBase64,
+} from './utils/vadAudioCapture';
 import {
   Play,
   Pause,
@@ -27,6 +33,7 @@ import {
   Download,
   Globe,
   RefreshCw,
+  Key,
 } from 'lucide-react';
 
 const PRIORITY_COLORS: Record<string, string> = {
@@ -265,7 +272,7 @@ export default function App() {
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-1.5">
             <Server className="w-3.5 h-3.5" />
-            <span>Sys: ONLINE • Gemini Native Audio</span>
+            <span>Sys: ONLINE • Hybrid Gemini + Groq Audio</span>
           </div>
         </div>
         <div className="italic text-[var(--info-tag)]">
@@ -454,15 +461,34 @@ function ActiveCallView({
   const [vadStatus, setVadStatus] = useState<VadStatus>('idle');
   const [audioLevel, setAudioLevel] = useState(0);
   const [isProcessingSegment, setIsProcessingSegment] = useState(false);
+  const [activeProvider, setActiveProvider] = useState<'gemini-3.8-flash' | 'groq-fallback'>('gemini-3.8-flash');
 
   const [phoneNumber, setPhoneNumber] = useState('');
   const [backendUrl, setBackendUrl] = useState(() => window.location.origin);
+  const [groqApiKey, setGroqApiKey] = useState(() => {
+    try {
+      return localStorage.getItem('groqApiKey') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [showGroqKeyInput, setShowGroqKeyInput] = useState(false);
 
   useEffect(() => {
     try {
       localStorage.setItem('backendUrl', backendUrl);
     } catch {}
   }, [backendUrl]);
+
+  useEffect(() => {
+    try {
+      if (groqApiKey.trim()) {
+        localStorage.setItem('groqApiKey', groqApiKey.trim());
+      } else {
+        localStorage.removeItem('groqApiKey');
+      }
+    } catch {}
+  }, [groqApiKey]);
 
   const [isConnected, setIsConnected] = useState<boolean | null>(null);
   const [rawError, setRawError] = useState<string | null>(null);
@@ -488,6 +514,25 @@ function ActiveCallView({
   const analysisRef = useRef<any>({});
   const segmentQueueRef = useRef<VadSegmentPayload[]>([]);
   const queueBusyRef = useRef(false);
+  const groqApiKeyRef = useRef(groqApiKey);
+
+  useEffect(() => {
+    groqApiKeyRef.current = groqApiKey;
+  }, [groqApiKey]);
+
+  const getApiHeaders = (includeJson = true): Record<string, string> => {
+    const headers: Record<string, string> = {
+      'ngrok-skip-browser-warning': 'true',
+    };
+    if (includeJson) {
+      headers['Content-Type'] = 'application/json';
+    }
+    const key = groqApiKeyRef.current.trim();
+    if (key) {
+      headers['x-groq-api-key'] = key;
+    }
+    return headers;
+  };
 
   const LANGUAGES = [
     { code: 'auto', label: 'Auto-detect' },
@@ -547,6 +592,7 @@ function ActiveCallView({
 
   // Sync state from selected case when it changes
   useEffect(() => {
+    setAnalysisUnavailable(false);
     if (currentCase) {
       const cleanedTurns = (currentCase.turns || []).filter(
         (t: any) => !isLegacyDeepgramMessage(t?.text) && !isLegacyDeepgramMessage(t?.originalText)
@@ -572,7 +618,6 @@ function ActiveCallView({
       );
       setMetaData(currentCase.metaData || null);
       setPhoneNumber(currentCase.phone || '');
-      // Reset per-call acoustic references on case switch
       setOperatorVoiceProfile(null);
       setCallerVoiceProfile(null);
       operatorRefAudioRef.current = null;
@@ -652,7 +697,6 @@ function ActiveCallView({
         });
         if (res.ok) {
           setIsConnected(true);
-          setRawError(null);
         } else {
           setIsConnected(false);
           setRawError(`Health check failed: ${res.status} ${res.statusText}`);
@@ -686,7 +730,6 @@ function ActiveCallView({
     setShowEnglishTranslation(nextShowEnglish);
 
     if (nextShowEnglish) {
-      // Check if any non-note turns are missing English translations
       const needsBackendTranslate = turns.some(
         (t, idx) => !t.isNote && !t.englishText && !(analysis?.translations && analysis.translations[idx.toString()])
       );
@@ -696,10 +739,13 @@ function ActiveCallView({
           const base = backendUrl.trim() || window.location.origin;
           const res = await fetch(`${base}/api/translate`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getApiHeaders(true),
             body: JSON.stringify({ turns }),
           });
           const data = await res.json();
+          if (data?.provider) {
+            setActiveProvider(data.provider === 'groq-fallback' ? 'groq-fallback' : 'gemini-3.8-flash');
+          }
           if (data && data.translations) {
             setTurns((prev) =>
               prev.map((t, idx) => ({
@@ -818,7 +864,7 @@ function ActiveCallView({
       const res = await fetch(uploadUrl, {
         method: 'POST',
         body: formData,
-        headers: { 'ngrok-skip-browser-warning': 'true' },
+        headers: getApiHeaders(false),
       });
 
       if (!res.ok) {
@@ -829,6 +875,10 @@ function ActiveCallView({
       const data = await res.json();
       if (data.error) {
         throw new Error(data.error);
+      }
+
+      if (data.provider) {
+        setActiveProvider(data.provider === 'groq-fallback' ? 'groq-fallback' : 'gemini-3.8-flash');
       }
 
       const localAudioUrl = URL.createObjectURL(file);
@@ -860,7 +910,7 @@ function ActiveCallView({
     }
   };
 
-  // Sequential queue processor so each VAD segment uses the latest updated acoustic voice profiles
+  // Sequential queue processor: concatenates any speech buffered while a request is in flight into one valid WAV
   const drainSegmentQueue = async () => {
     if (queueBusyRef.current) return;
     queueBusyRef.current = true;
@@ -868,8 +918,25 @@ function ActiveCallView({
 
     try {
       while (segmentQueueRef.current.length > 0) {
-        const segment = segmentQueueRef.current.shift()!;
-        await processSingleVadSegment(segment);
+        const batch = segmentQueueRef.current.splice(0, segmentQueueRef.current.length);
+        let segmentToSend: VadSegmentPayload;
+
+        if (batch.length === 1) {
+          segmentToSend = batch[0];
+        } else {
+          const mergedPcm16 = concatInt16Arrays(batch.map((s) => s.pcm16));
+          const mergedAudioBase64 = encodePcm16ToWavBase64(mergedPcm16);
+          const totalDurationMs = batch.reduce((sum, s) => sum + s.durationMs, 0);
+          segmentToSend = {
+            pcm16: mergedPcm16,
+            audioBase64: mergedAudioBase64,
+            tailAudioBase64: batch[batch.length - 1].tailAudioBase64,
+            durationMs: totalDurationMs,
+            elapsedSeconds: batch[0].elapsedSeconds,
+          };
+        }
+
+        await processSingleVadSegment(segmentToSend);
       }
     } finally {
       queueBusyRef.current = false;
@@ -899,10 +966,7 @@ function ActiveCallView({
 
       const response = await fetch(`${cleanUrl}/api/live-segment`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
-        },
+        headers: getApiHeaders(true),
         body: JSON.stringify({
           audioBase64: segment.audioBase64,
           mimeType: 'audio/wav',
@@ -918,7 +982,6 @@ function ActiveCallView({
         }),
       });
 
-      // Always update rolling tail overlap for acoustic continuity into the next segment
       previousTailAudioRef.current = segment.tailAudioBase64;
 
       if (!response.ok) {
@@ -930,7 +993,10 @@ function ActiveCallView({
       setRawError(null);
       setAnalysisUnavailable(false);
 
-      // Update stored acoustic voice profiles
+      if (data.provider) {
+        setActiveProvider(data.provider === 'groq-fallback' ? 'groq-fallback' : 'gemini-3.8-flash');
+      }
+
       if (data.operatorVoiceProfile) {
         setOperatorVoiceProfile(data.operatorVoiceProfile);
         operatorProfileRef.current = data.operatorVoiceProfile;
@@ -940,7 +1006,6 @@ function ActiveCallView({
         callerProfileRef.current = data.callerVoiceProfile;
       }
 
-      // Apply retroactive role correction if Gemini detected an ambiguous opening turn
       if (data.retroactiveRoleFix && typeof data.retroactiveRoleFix.turnIndex === 'number') {
         const { turnIndex, correctedSpeaker, reason } = data.retroactiveRoleFix;
         setTurns((prev) => {
@@ -955,7 +1020,6 @@ function ActiveCallView({
           });
         });
 
-        // If turn 0 was retroactively corrected, swap cached reference clip to match true role
         if (turnIndex === 0) {
           if (correctedSpeaker === 'Caller' && operatorRefAudioRef.current && !callerRefAudioRef.current) {
             callerRefAudioRef.current = operatorRefAudioRef.current;
@@ -981,7 +1045,6 @@ function ActiveCallView({
         }
       }
 
-      // Append new diarized segments and cache first high-confidence reference audio per speaker
       if (Array.isArray(data.segments) && data.segments.length > 0) {
         const newLines: TranscriptLine[] = data.segments.map((seg: any, idx: number) => {
           const speakerLabel = seg.speaker === 'Operator' ? 'Operator' : 'Caller';
@@ -1031,7 +1094,6 @@ function ActiveCallView({
         }));
       }
 
-      // Update unified emergency intelligence in the same response
       const geo = data.geolocation || {};
       setAnalysis((prev: any) => ({
         ...prev,
@@ -1069,7 +1131,6 @@ function ActiveCallView({
       streamRef.current = stream;
       audioChunksRef.current = [];
 
-      // Full-call recorder for Evidence / Audit playback
       try {
         const mediaRecorder = new MediaRecorder(stream);
         mediaRecorderRef.current = mediaRecorder;
@@ -1086,9 +1147,7 @@ function ActiveCallView({
           }
         };
         mediaRecorder.start(1000);
-      } catch {
-        // Optional full-call archive recording; live VAD capture runs independently
-      }
+      } catch {}
 
       const vadCapture = new VadAudioCapture({
         onVadStatusChange: (status) => setVadStatus(status),
@@ -1107,6 +1166,7 @@ function ActiveCallView({
       isRunningRef.current = true;
       setMicError(null);
       setRawError(null);
+      setAnalysisUnavailable(false);
     } catch (err: any) {
       setMicError(err.message || 'Microphone access denied or unavailable.');
       setIsRunning(false);
@@ -1138,6 +1198,7 @@ function ActiveCallView({
     setIsRunning(false);
     setVadStatus('idle');
     setAudioLevel(0);
+    setAnalysisUnavailable(false);
   };
 
   const analyzeTranscript = async (currentTurns: any[]) => {
@@ -1145,7 +1206,7 @@ function ActiveCallView({
       const base = backendUrl.trim() || window.location.origin;
       const res = await fetch(`${base}/api/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getApiHeaders(true),
         body: JSON.stringify({
           sourceLanguage,
           turns: currentTurns,
@@ -1157,6 +1218,9 @@ function ActiveCallView({
       }
       const data = await res.json();
       if (data) {
+        if (data.provider) {
+          setActiveProvider(data.provider === 'groq-fallback' ? 'groq-fallback' : 'gemini-3.8-flash');
+        }
         setAnalysis((prev: any) => ({ ...prev, ...data }));
         setAnalysisUnavailable(false);
       }
@@ -1202,7 +1266,6 @@ function ActiveCallView({
       })
     );
 
-    // Also swap stored acoustic voice profiles & cached reference audio snippets so future turns stay aligned
     const prevOpProfile = operatorProfileRef.current;
     const prevCallerProfile = callerProfileRef.current;
     setOperatorVoiceProfile(prevCallerProfile);
@@ -1313,20 +1376,24 @@ function ActiveCallView({
 
       {/* ACTIVE CALL HEADER / INGESTION BAR */}
       <div className="flex flex-wrap items-center justify-between gap-2 p-2 bg-[var(--bg-panel)] border border-[var(--border)] shrink-0">
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
           <input
             type="text"
             value={currentCase.id}
             onChange={(e) => updateCaseId(currentCase.id, e.target.value)}
-            className="font-mono text-base font-bold text-[var(--text-primary)] bg-transparent border-b border-transparent focus:border-[var(--info-tag)] hover:border-[var(--border)] outline-none w-28"
+            className="font-mono text-base font-bold text-[var(--text-primary)] bg-transparent border-b border-transparent focus:border-[var(--info-tag)] hover:border-[var(--border)] outline-none w-24"
           />
 
-          {/* Connection Status */}
+          {/* Active Engine & Connection Status */}
           <div className="flex items-center gap-1.5 px-2 py-1 bg-[var(--bg-main)] border border-[var(--border)]">
             {isConnected === false ? (
               <XCircle className="w-3 h-3 text-[var(--critical)]" />
             ) : isConnected === true ? (
-              <CheckCircle className="w-3 h-3 text-[var(--resolved)]" />
+              <CheckCircle
+                className={`w-3 h-3 ${
+                  activeProvider === 'groq-fallback' ? 'text-[var(--high)]' : 'text-[var(--resolved)]'
+                }`}
+              />
             ) : (
               <Activity className="w-3 h-3 text-[var(--text-secondary)]" />
             )}
@@ -1334,13 +1401,46 @@ function ActiveCallView({
               className={`text-xs font-mono ${
                 isConnected === false
                   ? 'text-[var(--critical)]'
+                  : activeProvider === 'groq-fallback'
+                  ? 'text-[var(--high)]'
                   : isConnected === true
                   ? 'text-[var(--resolved)]'
                   : 'text-[var(--text-secondary)]'
               }`}
             >
-              {isConnected === false ? 'BACKEND OFFLINE' : isConnected === true ? 'GEMINI AUDIO READY' : 'CONNECTING'}
+              {isConnected === false
+                ? 'BACKEND OFFLINE'
+                : isConnected === true
+                ? activeProvider === 'groq-fallback'
+                  ? 'GROQ FALLBACK'
+                  : 'GEMINI AUDIO'
+                : 'CONNECTING'}
             </span>
+          </div>
+
+          {/* Compact Optional Groq Key Button / Input */}
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => setShowGroqKeyInput((prev) => !prev)}
+              title="Optional Groq API key for instant fallback during Gemini rate limits"
+              className={`flex items-center gap-1 px-2 py-1 text-[10px] font-mono font-bold border transition-colors ${
+                groqApiKey.trim()
+                  ? 'bg-[var(--bg-main)] text-[var(--resolved)] border-[var(--resolved)]/60'
+                  : 'bg-[var(--bg-main)] text-[var(--text-secondary)] border-[var(--border)] hover:text-white'
+              }`}
+            >
+              <Key className="w-3 h-3" />
+              {groqApiKey.trim() ? 'GROQ KEY ✓' : 'GROQ KEY'}
+            </button>
+            {showGroqKeyInput && (
+              <input
+                type="password"
+                value={groqApiKey}
+                onChange={(e) => setGroqApiKey(e.target.value)}
+                placeholder="gsk_..."
+                className="bg-[var(--bg-main)] border border-[var(--info-tag)] text-xs font-mono text-[var(--text-primary)] px-2 py-1 w-32 focus:outline-none"
+              />
+            )}
           </div>
 
           {/* Backend URL Config */}
@@ -1349,7 +1449,7 @@ function ActiveCallView({
             value={backendUrl}
             onChange={(e) => setBackendUrl(e.target.value)}
             disabled={isRunning}
-            className="bg-[var(--bg-main)] border border-[var(--border)] text-xs text-[var(--text-primary)] px-2 py-1 w-36 focus:outline-none focus:border-[var(--info-tag)] disabled:opacity-50"
+            className="bg-[var(--bg-main)] border border-[var(--border)] text-xs text-[var(--text-primary)] px-2 py-1 w-32 focus:outline-none focus:border-[var(--info-tag)] disabled:opacity-50"
             placeholder="Backend URL"
           />
 
@@ -1372,7 +1472,7 @@ function ActiveCallView({
 
         <div className="flex items-center gap-2">
           <span className="text-xs text-[var(--text-secondary)] uppercase">Stress Vulnerability Index</span>
-          {analysisUnavailable && (
+          {isRunning && isProcessingSegment && analysisUnavailable && (
             <span className="text-[10px] text-[var(--critical)] font-bold animate-pulse">RETRYING</span>
           )}
           <span
@@ -1663,7 +1763,7 @@ function ActiveCallView({
               {!isRunning && uploadState !== 'uploading' && uploadState !== 'processing' && turns.length === 0 && (
                 <div className="flex flex-col justify-center items-center h-full text-[var(--text-secondary)] gap-6 p-8">
                   <div className="text-center italic opacity-70">
-                    No transcript data available. Choose an input method to begin autonomous Gemini audio ingestion.
+                    No transcript data available. Choose an input method to begin autonomous hybrid audio ingestion.
                   </div>
                   <div className="flex gap-4">
                     <button
@@ -1696,7 +1796,9 @@ function ActiveCallView({
                     />
                     <span>
                       {isProcessingSegment
-                        ? 'Processing speech segment via Gemini Native Audio...'
+                        ? `Processing speech segment via ${
+                            activeProvider === 'groq-fallback' ? 'Groq Fallback' : 'Gemini 3.8 Flash'
+                          }...`
                         : vadStatus === 'speech'
                         ? 'Speech detected — capturing 16kHz WAV utterance...'
                         : 'VAD active — speak into microphone (silence is filtered automatically)...'}
@@ -1712,7 +1814,7 @@ function ActiveCallView({
                     <span>
                       {uploadState === 'uploading'
                         ? 'Uploading audio...'
-                        : 'Transcribing and diarizing with Gemini...'}
+                        : 'Transcribing and diarizing audio...'}
                     </span>
                   </div>
                 </div>

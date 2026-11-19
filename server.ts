@@ -11,7 +11,13 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '25mb' }));
 
-app.get('/health', (_req, res) => res.json({ status: 'ok', engine: 'gemini-native-audio' }));
+app.get('/health', (_req, res) =>
+  res.json({
+    status: 'ok',
+    engine: 'gemini-3.8-flash-with-groq-fallback',
+    geminiCooldownRemainingMs: Math.max(0, geminiCooldownUntil - Date.now()),
+  })
+);
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -27,8 +33,13 @@ const ai = new GoogleGenAI({
   },
 });
 
-const PRIMARY_MODEL = 'gemini-2.5-flash';
-const FALLBACK_MODEL = 'gemini-3.8-flash';
+const PRIMARY_GEMINI_MODEL = 'gemini-3.8-flash';
+const GROQ_WHISPER_MODEL = 'whisper-large-v3-turbo';
+const GROQ_LLM_PRIMARY = 'openai/gpt-oss-20b';
+const GROQ_LLM_FALLBACK = 'qwen/qwen3.8-27b';
+
+// In-memory cooldown timestamp to respect Gemini Free Tier 5 RPM and 503/429 spikes
+let geminiCooldownUntil = 0;
 
 function formatElapsedTimestamp(seconds: number): string {
   const safe = Math.max(0, Math.floor(seconds || 0));
@@ -40,7 +51,8 @@ function formatElapsedTimestamp(seconds: number): string {
 function extractJsonFromText(rawText: string): any {
   if (!rawText) return null;
   const cleaned = rawText.trim();
-  const blockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const fenceRegex = new RegExp('\\x60\\x60\\x60(?:json)?\\s*([\\s\\S]*?)\\s*\\x60\\x60\\x60', 'i');
+  const blockMatch = cleaned.match(fenceRegex);
   if (blockMatch) {
     try {
       return JSON.parse(blockMatch[1]);
@@ -65,48 +77,193 @@ function extractJsonFromText(rawText: string): any {
   }
 }
 
-async function generateWithGeminiFallback(options: {
+function getGroqApiKey(req: express.Request): string | null {
+  const headerKey = req.header('x-groq-api-key');
+  const key = (process.env.GROQ_API_KEY || headerKey || '').trim();
+  return key || null;
+}
+
+function parseRetryDelayMs(err: any): number {
+  const msg = String(err?.message || err || '');
+  // Match "retryDelay":"18s" or "retry in 18.8s"
+  const retryDelayMatch = msg.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
+  if (retryDelayMatch) {
+    return Math.ceil(parseFloat(retryDelayMatch[1]) * 1000) + 1000;
+  }
+  const retryInMatch = msg.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
+  if (retryInMatch) {
+    return Math.ceil(parseFloat(retryInMatch[1]) * 1000) + 1000;
+  }
+  return 20000;
+}
+
+function isGeminiInCooldown(): boolean {
+  return Date.now() < geminiCooldownUntil;
+}
+
+async function callGeminiPrimary(options: {
   contents: any;
   config?: any;
-  models?: string[];
-}): Promise<{ text: string; modelUsed: string }> {
+}): Promise<{ text: string; provider: 'gemini-3.8-flash' }> {
   if (!geminiApiKey) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
+  if (isGeminiInCooldown()) {
+    const remaining = Math.ceil((geminiCooldownUntil - Date.now()) / 1000);
+    throw new Error(`GEMINI_COOLDOWN: ${remaining}s remaining`);
+  }
 
-  const models = options.models || [PRIMARY_MODEL, FALLBACK_MODEL];
+  // Reserve 5 RPM slot (+12500ms) immediately before/after call
+  geminiCooldownUntil = Math.max(geminiCooldownUntil, Date.now() + 12500);
+
+  try {
+    const response = await ai.models.generateContent({
+      model: PRIMARY_GEMINI_MODEL,
+      contents: options.contents,
+      config: options.config,
+    });
+
+    const text = response.text || '';
+    if (!text.trim()) {
+      throw new Error(`Model ${PRIMARY_GEMINI_MODEL} returned an empty response.`);
+    }
+    return { text, provider: 'gemini-3.8-flash' };
+  } catch (err: any) {
+    const status = Number(err?.status || err?.code || 0);
+    const msg = String(err?.message || err || '');
+    if (status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+      const delayMs = parseRetryDelayMs(err);
+      geminiCooldownUntil = Math.max(geminiCooldownUntil, Date.now() + delayMs);
+    } else if (status === 503 || msg.includes('503') || msg.includes('UNAVAILABLE')) {
+      geminiCooldownUntil = Math.max(geminiCooldownUntil, Date.now() + 20000);
+    }
+    console.warn(`[Gemini] ${PRIMARY_GEMINI_MODEL} failed (${status || 'ERR'}): ${msg}`);
+    throw err;
+  }
+}
+
+async function callGroqWhisper(
+  audioBuffer: Buffer,
+  groqApiKey: string,
+  mimeType = 'audio/wav',
+  languageHint?: string
+): Promise<{ text: string; language: string; avgNoSpeechProb: number; isSilence: boolean }> {
+  const formData = new FormData();
+  const ext = mimeType.includes('webm') ? 'webm' : mimeType.includes('mpeg') ? 'mp3' : 'wav';
+  const blob = new Blob([audioBuffer], { type: mimeType });
+  formData.append('file', blob, `segment.${ext}`);
+  formData.append('model', GROQ_WHISPER_MODEL);
+  formData.append('response_format', 'verbose_json');
+  formData.append('temperature', '0');
+  if (languageHint && languageHint !== 'auto' && languageHint.length <= 5) {
+    formData.append('language', languageHint);
+  }
+
+  const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${groqApiKey}`,
+    },
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Groq Whisper HTTP ${res.status}: ${errText}`);
+  }
+
+  const data: any = await res.json();
+  const text = (data?.text || '').trim();
+  const language = data?.language || 'Auto-detect';
+
+  let avgNoSpeechProb = 0;
+  if (Array.isArray(data?.segments) && data.segments.length > 0) {
+    const sum = data.segments.reduce((acc: number, s: any) => acc + (Number(s?.no_speech_prob) || 0), 0);
+    avgNoSpeechProb = sum / data.segments.length;
+  }
+
+  const isSilence = !text || avgNoSpeechProb > 0.75;
+  return { text, language, avgNoSpeechProb, isSilence };
+}
+
+async function callGroqChatJson(
+  systemPrompt: string,
+  userPrompt: string,
+  groqApiKey: string
+): Promise<{ text: string; modelUsed: string }> {
+  const candidates: Array<{ model: string; reasoning_effort: 'low' | 'none' }> = [
+    { model: GROQ_LLM_PRIMARY, reasoning_effort: 'low' },
+    { model: GROQ_LLM_FALLBACK, reasoning_effort: 'none' },
+  ];
+
   let lastError: any = null;
-
-  for (const model of models) {
+  for (const candidate of candidates) {
     try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: options.contents,
-        config: options.config,
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${groqApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: candidate.model,
+          reasoning_effort: candidate.reasoning_effort,
+          response_format: { type: 'json_object' },
+          temperature: 0.1,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+        }),
       });
 
-      const text = response.text || '';
-      if (!text.trim()) {
-        throw new Error(`Model ${model} returned an empty response.`);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Groq Chat (${candidate.model}) HTTP ${res.status}: ${errText}`);
       }
-      return { text, modelUsed: model };
+
+      const data: any = await res.json();
+      const content = data?.choices?.[0]?.message?.content || '';
+      if (!content.trim()) {
+        throw new Error(`Groq Chat (${candidate.model}) returned empty content.`);
+      }
+      return { text: content, modelUsed: candidate.model };
     } catch (err: any) {
       lastError = err;
-      const status = err?.status || err?.code || 'ERR';
-      console.warn(`[Gemini] ${model} failed (${status}): ${err?.message || err}`);
-      if (err?.status === 400) {
-        throw err;
-      }
-      // On 429 rate limit, 503 overload, or transient error, immediately fall back to next model
+      console.warn(`[Groq] ${candidate.model} failed: ${err?.message || err}`);
     }
   }
 
-  throw lastError || new Error('All Gemini models failed.');
+  throw lastError || new Error('All Groq LLM models failed.');
+}
+
+async function generateTextJsonWithFallback(options: {
+  prompt: string;
+  systemPrompt?: string;
+  groqApiKey: string | null;
+}): Promise<{ text: string; provider: 'gemini-3.8-flash' | 'groq-fallback' }> {
+  try {
+    const geminiRes = await callGeminiPrimary({
+      contents: options.prompt,
+      config: { responseMimeType: 'application/json', temperature: 0.1 },
+    });
+    return { text: geminiRes.text, provider: 'gemini-3.8-flash' };
+  } catch (geminiErr: any) {
+    if (!options.groqApiKey) {
+      throw geminiErr;
+    }
+    const groqRes = await callGroqChatJson(
+      options.systemPrompt || 'You are a strict JSON API. Return only valid JSON.',
+      options.prompt,
+      options.groqApiKey
+    );
+    return { text: groqRes.text, provider: 'groq-fallback' };
+  }
 }
 
 // -------------------------------------------------------------
 // POST /api/live-segment
-// Unified Live VAD Audio -> Diarization + Multilingual Transcription + Intelligence
+// Unified Live VAD Audio -> Gemini 3.8 Flash Primary + Automatic Groq Fallback
 // -------------------------------------------------------------
 app.post('/api/live-segment', async (req, res) => {
   try {
@@ -128,6 +285,7 @@ app.post('/api/live-segment', async (req, res) => {
       return res.status(400).json({ error: 'Missing audioBase64 payload.' });
     }
 
+    const groqApiKey = getGroqApiKey(req);
     const defaultTimestamp = formatElapsedTimestamp(elapsedSeconds);
     const recentTurnsFormatted =
       Array.isArray(recentTurns) && recentTurns.length > 0
@@ -147,87 +305,7 @@ app.post('/api/live-segment', async (req, res) => {
         ? `Operator selected language hint: "${sourceLanguageHint}", though you MUST still automatically detect the true spoken language(s) and any mid-sentence code-switching.`
         : 'Automatically detect the spoken language(s) and any mid-sentence code-switching across ALL languages (Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati, Punjabi, Kannada, Malayalam, Urdu, English, Hinglish, etc.).';
 
-    const parts: any[] = [];
-
-    if (operatorRefAudioBase64) {
-      parts.push({
-        text: 'ACOUSTIC REFERENCE AUDIO — CONFIRMED "Operator" VOICE (match against this voice timbre/pitch/cadence):',
-      });
-      parts.push({
-        inlineData: {
-          data: operatorRefAudioBase64,
-          mimeType: 'audio/wav',
-        },
-      });
-    }
-
-    if (callerRefAudioBase64) {
-      parts.push({
-        text: 'ACOUSTIC REFERENCE AUDIO — CONFIRMED "Caller" VOICE (match against this voice timbre/pitch/cadence):',
-      });
-      parts.push({
-        inlineData: {
-          data: callerRefAudioBase64,
-          mimeType: 'audio/wav',
-        },
-      });
-    }
-
-    if (previousTailAudioBase64) {
-      parts.push({
-        text: 'SHORT ROLLING AUDIO OVERLAP (~0.95s tail of the immediately preceding utterance for acoustic continuity ONLY — do NOT re-transcribe words already captured in the last turn):',
-      });
-      parts.push({
-        inlineData: {
-          data: previousTailAudioBase64,
-          mimeType: 'audio/wav',
-        },
-      });
-    }
-
-    parts.push({
-      text: `NEW LIVE SPEECH SEGMENT TO TRANSCRIBE, DIARIZE, AND ANALYZE (Call timestamp: ${defaultTimestamp}):`,
-    });
-    parts.push({
-      inlineData: {
-        data: audioBase64,
-        mimeType,
-      },
-    });
-
-    const instructionPrompt = `
-You are an emergency helpline (NHAA 14566) real-time native-audio transcription, acoustic speaker diarization, and emergency triage intelligence engine.
-
-Analyze the NEW LIVE SPEECH SEGMENT audio directly and return ONE strict JSON object.
-
-1. SILENCE / NOISE GUARD
-If the new audio segment contains ONLY background noise, breathing, static, or unintelligible non-speech sounds with NO spoken words, return "segments": [] and preserve the existing profiles and intelligence state. Never hallucinate words.
-
-2. MULTILINGUAL TRANSCRIPTION & CODE-SWITCHING
-${langHintNote}
-In "originalText": transcribe verbatim in the NATIVE SCRIPT of every spoken language (e.g., Devanagari for Hindi/Marathi, Bengali script for Bengali, Tamil script for Tamil, Telugu script for Telugu, etc.). If the speaker code-switches mid-sentence (e.g., Hinglish, Banglish, Tanglish), preserve the exact native script + English words seamlessly.
-In "englishText": provide a faithful, natural English translation preserving all emergency details, numbers, landmarks, and urgency. If already English, repeat the English text cleanly.
-
-3. 100% AUTOMATIC SPEAKER DIARIZATION ("Operator" vs "Caller")
-If multiple people speak in this single audio segment, split them into separate sequential items in "segments".
-Match speakers using ALL three signals together:
-(A) Acoustic Voice Matching: Compare the voice(s) in the new audio against the Acoustic Reference Audio clips (if provided) and the stored voice profiles below:
-- Stored Operator Voice Profile: ${JSON.stringify(operatorVoiceProfile || 'Not yet established')}
-- Stored Caller Voice Profile: ${JSON.stringify(callerVoiceProfile || 'Not yet established')}
-(B) Emergency Helpline Role Cues:
-- "Operator": Helpline agent/dispatcher conducting intake, greetings ("14566 helpline", "Hello, how can I help?"), calm triage questions ("What is your location?", "Are you safe?"), reassurance, dispatch updates.
-- "Caller": Citizen/victim reporting an emergency, expressing distress/panic/urgency, answering triage questions, describing threats, injuries, or location.
-(C) Retroactive Role Correction ("retroactiveRoleFix"):
-- Review the last 8 labeled transcript turns below:
-${recentTurnsFormatted}
-- If an earlier opening line (such as "Hello?" or "Haan?") was ambiguous and tentatively mislabeled, and this new segment's voice acoustics or role cues prove the earlier turn belonged to the other speaker, set "retroactiveRoleFix" to { "turnIndex": <number>, "correctedSpeaker": "Operator" | "Caller", "reason": "<brief reason>" } and update both voice profiles accordingly. Otherwise set "retroactiveRoleFix": null.
-
-4. VOCAL + SEMANTIC EMERGENCY INTELLIGENCE
-Stress Vulnerability Index ("stressVulnerabilityIndex", 0-100): Compute from BOTH:
-- Vocal & acoustic cues in the audio: voice pitch elevation, tremor/shakiness, crying/sobbing, shouting/screaming, rapid/gasping breath, panic, and background distress sounds (sirens, alarms, yelling, crashing, traffic).
-- Semantic urgency in the conversation (active violence, fire, medical emergency, self-harm, trapped caller).
-Geolocation: Extract any address, landmark, road, station, locality, or city mentioned across the conversation (translated to English in "extractedLocation"). Provide realistic coordinates in "location_estimate" when a real place is mentioned, or null if unknown.
-
+    const schemaDescription = `
 REQUIRED STRICT JSON SCHEMA:
 {
   "segments": [
@@ -293,20 +371,188 @@ ${JSON.stringify({
 })}
 `;
 
-    parts.push({ text: instructionPrompt });
+    let parsed: any = null;
+    let provider: 'gemini-3.8-flash' | 'groq-fallback' = 'gemini-3.8-flash';
 
-    const { text, modelUsed } = await generateWithGeminiFallback({
-      models: [PRIMARY_MODEL, FALLBACK_MODEL],
-      contents: { parts },
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
-      },
-    });
+    // 1) Try Gemini 3.8 Flash Native Audio if not in cooldown
+    let shouldFallbackToGroq = isGeminiInCooldown() || !geminiApiKey;
 
-    const parsed = extractJsonFromText(text);
-    if (!parsed || typeof parsed !== 'object') {
-      throw new Error('Failed to parse structured JSON from Gemini audio response.');
+    if (!shouldFallbackToGroq) {
+      try {
+        const parts: any[] = [];
+
+        if (operatorRefAudioBase64) {
+          parts.push({
+            text: 'ACOUSTIC REFERENCE AUDIO — CONFIRMED "Operator" VOICE (match against this voice timbre/pitch/cadence):',
+          });
+          parts.push({
+            inlineData: {
+              data: operatorRefAudioBase64,
+              mimeType: 'audio/wav',
+            },
+          });
+        }
+
+        if (callerRefAudioBase64) {
+          parts.push({
+            text: 'ACOUSTIC REFERENCE AUDIO — CONFIRMED "Caller" VOICE (match against this voice timbre/pitch/cadence):',
+          });
+          parts.push({
+            inlineData: {
+              data: callerRefAudioBase64,
+              mimeType: 'audio/wav',
+            },
+          });
+        }
+
+        if (previousTailAudioBase64) {
+          parts.push({
+            text: 'SHORT ROLLING AUDIO OVERLAP (~0.95s tail of the immediately preceding utterance for acoustic continuity ONLY — do NOT re-transcribe words already captured in the last turn):',
+          });
+          parts.push({
+            inlineData: {
+              data: previousTailAudioBase64,
+              mimeType: 'audio/wav',
+            },
+          });
+        }
+
+        parts.push({
+          text: `NEW LIVE SPEECH SEGMENT TO TRANSCRIBE, DIARIZE, AND ANALYZE (Call timestamp: ${defaultTimestamp}):`,
+        });
+        parts.push({
+          inlineData: {
+            data: audioBase64,
+            mimeType,
+          },
+        });
+
+        const instructionPrompt = `
+You are an emergency helpline (NHAA 14566) real-time native-audio transcription, acoustic speaker diarization, and emergency triage intelligence engine.
+
+Analyze the NEW LIVE SPEECH SEGMENT audio directly and return ONE strict JSON object.
+
+1. SILENCE / NOISE GUARD
+If the new audio segment contains ONLY background noise, breathing, static, or unintelligible non-speech sounds with NO spoken words, return "segments": [] and preserve the existing profiles and intelligence state. Never hallucinate words.
+
+2. MULTILINGUAL TRANSCRIPTION & CODE-SWITCHING
+${langHintNote}
+In "originalText": transcribe verbatim in the NATIVE SCRIPT of every spoken language. If the speaker code-switches mid-sentence, preserve the exact native script + English words seamlessly.
+In "englishText": provide a faithful, natural English translation preserving all emergency details, numbers, landmarks, and urgency.
+
+3. 100% AUTOMATIC SPEAKER DIARIZATION ("Operator" vs "Caller")
+If multiple people speak in this single audio segment, split them into separate sequential items in "segments".
+Match speakers using ALL three signals together:
+(A) Acoustic Voice Matching against stored profiles:
+- Stored Operator Voice Profile: ${JSON.stringify(operatorVoiceProfile || 'Not yet established')}
+- Stored Caller Voice Profile: ${JSON.stringify(callerVoiceProfile || 'Not yet established')}
+(B) Emergency Helpline Role Cues ("Operator" vs "Caller").
+(C) Retroactive Role Correction ("retroactiveRoleFix") reviewing the last 8 labeled turns:
+${recentTurnsFormatted}
+
+4. VOCAL + SEMANTIC EMERGENCY INTELLIGENCE
+Compute Stress Vulnerability Index (0-100) from BOTH vocal/acoustic cues and semantic urgency. Extract any location into English.
+${schemaDescription}
+`;
+        parts.push({ text: instructionPrompt });
+
+        const geminiRes = await callGeminiPrimary({
+          contents: { parts },
+          config: {
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+          },
+        });
+
+        parsed = extractJsonFromText(geminiRes.text);
+        if (!parsed || typeof parsed !== 'object') {
+          throw new Error('Failed to parse structured JSON from Gemini audio response.');
+        }
+        provider = 'gemini-3.8-flash';
+      } catch (geminiErr: any) {
+        shouldFallbackToGroq = true;
+        if (!groqApiKey) {
+          throw geminiErr;
+        }
+      }
+    }
+
+    // 2) Automatic Groq Fallback (Whisper Turbo -> GPT-OSS-20B / Qwen3.8-27B)
+    if (shouldFallbackToGroq) {
+      if (!groqApiKey) {
+        return res.status(503).json({
+          error:
+            'Gemini is in cooldown/unavailable and GROQ_API_KEY is not configured. Add a Groq API key via GROQ KEY or server env.',
+        });
+      }
+
+      const wavBuffer = Buffer.from(audioBase64, 'base64');
+      const whisper = await callGroqWhisper(wavBuffer, groqApiKey, mimeType, sourceLanguageHint);
+
+      if (whisper.isSilence) {
+        return res.json({
+          provider: 'groq-fallback',
+          modelUsed: GROQ_WHISPER_MODEL,
+          segments: [],
+          operatorVoiceProfile: operatorVoiceProfile || null,
+          callerVoiceProfile: callerVoiceProfile || null,
+          retroactiveRoleFix: null,
+          sourceLanguage: currentAnalysis?.detectedLanguage || whisper.language || 'Auto-detect',
+          callerStatus: currentAnalysis?.callerStatus || 'Unknown',
+          geolocation: {
+            extractedLocation: currentAnalysis?.extractedLocation ?? null,
+            locationStatus: currentAnalysis?.locationStatus || 'unknown',
+            location_estimate: currentAnalysis?.location_estimate || null,
+          },
+          stressVulnerabilityIndex: Number(currentAnalysis?.riskScore || 0),
+          sviRationale: Array.isArray(currentAnalysis?.emotionalFactors) ? currentAnalysis.emotionalFactors : [],
+          sentiment: currentAnalysis?.sentiment || 'Neutral',
+          detectedRiskSignals: Array.isArray(currentAnalysis?.signals) ? currentAnalysis.signals : [],
+          suggestedQuestions: Array.isArray(currentAnalysis?.suggestedQuestions)
+            ? currentAnalysis.suggestedQuestions
+            : [],
+          recommendedActions: Array.isArray(currentAnalysis?.recommendedActions)
+            ? currentAnalysis.recommendedActions
+            : [],
+          caseTitle: currentAnalysis?.caseTitle || null,
+        });
+      }
+
+      const groqPrompt = `
+You are an emergency helpline (NHAA 14566) real-time diarization, multilingual translation, and emergency triage intelligence engine.
+
+A new speech segment was transcribed by Whisper:
+- Raw Transcript: ${JSON.stringify(whisper.text)}
+- Detected Language: ${JSON.stringify(whisper.language)}
+- Call Timestamp: ${defaultTimestamp}
+- ${langHintNote}
+
+Stored Speaker Voice Profiles (preserve/update):
+- Operator Voice Profile: ${JSON.stringify(operatorVoiceProfile || 'Not yet established')}
+- Caller Voice Profile: ${JSON.stringify(callerVoiceProfile || 'Not yet established')}
+
+Last 8 Labeled Transcript Turns:
+${recentTurnsFormatted}
+
+INSTRUCTIONS:
+1. Diarize the new transcript into one or more sequential "segments" labeled "Operator" or "Caller" based on helpline role cues and conversational turn-taking.
+2. Preserve native script in "originalText" and provide accurate natural English in "englishText".
+3. If an earlier turn in the last 8 turns was mislabeled, set "retroactiveRoleFix" to { "turnIndex": <number>, "correctedSpeaker": "Operator" | "Caller", "reason": "<brief reason>" }; otherwise null.
+4. Compute "stressVulnerabilityIndex" (0-100), "sentiment", "callerStatus", "geolocation", "detectedRiskSignals", "suggestedQuestions", "recommendedActions", and "caseTitle".
+${schemaDescription}
+`;
+
+      const groqChat = await callGroqChatJson(
+        'You are a strict JSON emergency triage & diarization engine. Output ONLY a valid JSON object matching the requested schema.',
+        groqPrompt,
+        groqApiKey
+      );
+
+      parsed = extractJsonFromText(groqChat.text);
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('Failed to parse structured JSON from Groq fallback response.');
+      }
+      provider = 'groq-fallback';
     }
 
     const segments = Array.isArray(parsed.segments)
@@ -326,7 +572,8 @@ ${JSON.stringify({
     const svi = Math.max(0, Math.min(100, Number(parsed.stressVulnerabilityIndex ?? parsed.riskScore ?? 0) || 0));
 
     return res.json({
-      modelUsed,
+      provider,
+      modelUsed: provider,
       segments,
       operatorVoiceProfile: parsed.operatorVoiceProfile || operatorVoiceProfile || null,
       callerVoiceProfile: parsed.callerVoiceProfile || callerVoiceProfile || null,
@@ -335,20 +582,32 @@ ${JSON.stringify({
           ? {
               turnIndex: parsed.retroactiveRoleFix.turnIndex,
               correctedSpeaker: parsed.retroactiveRoleFix.correctedSpeaker === 'Operator' ? 'Operator' : 'Caller',
-              reason: parsed.retroactiveRoleFix.reason || 'Acoustic & conversational role refinement',
+              reason: parsed.retroactiveRoleFix.reason || 'Conversational role refinement',
             }
           : null,
       sourceLanguage: parsed.sourceLanguage || 'Auto-detect',
       callerStatus: parsed.callerStatus || 'Unknown',
       geolocation: {
-        extractedLocation: geo.extractedLocation ?? null,
+        extractedLocation: geo.extractedLocation ?? parsed.extractedLocation ?? null,
         locationStatus: geo.locationStatus || 'unknown',
         location_estimate: geo.location_estimate || null,
       },
+      extractedLocation: geo.extractedLocation ?? parsed.extractedLocation ?? null,
+      locationConfidence: geo.location_estimate?.confidence || 'unknown',
       stressVulnerabilityIndex: svi,
+      riskScore: svi,
       sviRationale: Array.isArray(parsed.sviRationale) ? parsed.sviRationale : [],
       sentiment: parsed.sentiment || 'Neutral',
-      detectedRiskSignals: Array.isArray(parsed.detectedRiskSignals) ? parsed.detectedRiskSignals : [],
+      detectedRiskSignals: Array.isArray(parsed.detectedRiskSignals)
+        ? parsed.detectedRiskSignals
+        : Array.isArray(parsed.signals)
+        ? parsed.signals
+        : [],
+      signals: Array.isArray(parsed.detectedRiskSignals)
+        ? parsed.detectedRiskSignals
+        : Array.isArray(parsed.signals)
+        ? parsed.signals
+        : [],
       suggestedQuestions: Array.isArray(parsed.suggestedQuestions) ? parsed.suggestedQuestions : [],
       recommendedActions: Array.isArray(parsed.recommendedActions) ? parsed.recommendedActions : [],
       caseTitle: parsed.caseTitle || null,
@@ -360,13 +619,14 @@ ${JSON.stringify({
 });
 
 // -------------------------------------------------------------
-// REST Endpoint: Analyze Transcript (Fallback / Uploaded File Analysis)
+// REST Endpoint: Analyze Transcript (Gemini 3.8 Flash -> Groq Fallback)
 // -------------------------------------------------------------
 app.post('/api/analyze', async (req, res) => {
   try {
     const { turns, sourceLanguage } = req.body;
     if (!turns || turns.length === 0) {
       return res.json({
+        provider: 'gemini-3.8-flash',
         riskScore: 0,
         signals: [],
         recommendedActions: [],
@@ -378,6 +638,7 @@ app.post('/api/analyze', async (req, res) => {
       });
     }
 
+    const groqApiKey = getGroqApiKey(req);
     const transcriptText = turns
       .map((t: any, index: number) => `[Turn ${index}] ${t.speaker}: ${t.originalText || t.text}`)
       .join('\n');
@@ -422,6 +683,7 @@ ${transcriptText}
 `;
 
     let parsedReport: any = {
+      provider: 'gemini-3.8-flash',
       riskScore: 0,
       signals: [],
       emotionalFactors: [],
@@ -437,17 +699,16 @@ ${transcriptText}
     };
 
     try {
-      const { text } = await generateWithGeminiFallback({
-        models: [PRIMARY_MODEL, FALLBACK_MODEL],
-        contents: prompt,
-        config: { responseMimeType: 'application/json', temperature: 0.1 },
+      const { text, provider } = await generateTextJsonWithFallback({
+        prompt,
+        groqApiKey,
       });
       const extracted = extractJsonFromText(text);
       if (extracted && typeof extracted === 'object') {
-        parsedReport = { ...parsedReport, ...extracted };
+        parsedReport = { ...parsedReport, ...extracted, provider };
       }
     } catch (apiError: any) {
-      console.warn('Analysis fallback:', apiError?.message || apiError);
+      console.warn('Analysis fallback error:', apiError?.message || apiError);
       return res.json(parsedReport);
     }
 
@@ -459,15 +720,16 @@ ${transcriptText}
 });
 
 // -------------------------------------------------------------
-// REST Endpoint: Translate Entire Transcript
+// REST Endpoint: Translate Entire Transcript (Gemini 3.8 Flash -> Groq Fallback)
 // -------------------------------------------------------------
 app.post('/api/translate', async (req, res) => {
   try {
     const { turns } = req.body;
     if (!turns || turns.length === 0) {
-      return res.json({ translations: {} });
+      return res.json({ translations: {}, provider: 'gemini-3.8-flash' });
     }
 
+    const groqApiKey = getGroqApiKey(req);
     const transcriptText = turns
       .map((t: any, i: number) => `[Turn ${i}] ${t.speaker}: ${t.originalText || t.text}`)
       .join('\n');
@@ -488,14 +750,13 @@ Transcript:
 ${transcriptText}
 `;
 
-    const { text } = await generateWithGeminiFallback({
-      models: [PRIMARY_MODEL, FALLBACK_MODEL],
-      contents: prompt,
-      config: { responseMimeType: 'application/json', temperature: 0.1 },
+    const { text, provider } = await generateTextJsonWithFallback({
+      prompt,
+      groqApiKey,
     });
 
     const parsed = extractJsonFromText(text) || { translations: {} };
-    return res.json(parsed);
+    return res.json({ ...parsed, provider });
   } catch (error: any) {
     console.error('Translation Endpoint Error:', error?.message || error);
     return res.status(500).json({ error: error?.message || 'Failed to translate transcript' });
@@ -503,7 +764,7 @@ ${transcriptText}
 });
 
 // -------------------------------------------------------------
-// REST Endpoint: File Upload Transcription (Using Gemini Native Audio)
+// REST Endpoint: File Upload Transcription (Gemini 3.8 Flash -> Groq Fallback)
 // -------------------------------------------------------------
 app.post('/api/transcribe_file', upload.single('file'), async (req, res) => {
   let filePath: string | null = null;
@@ -514,6 +775,7 @@ app.post('/api/transcribe_file', upload.single('file'), async (req, res) => {
 
   try {
     filePath = file.path;
+    const groqApiKey = getGroqApiKey(req);
     const fileBuffer = fs.readFileSync(file.path);
     const base64Data = fileBuffer.toString('base64');
 
@@ -522,7 +784,7 @@ Listen carefully to this emergency audio file and return a strict JSON object wi
 
 CRITICAL INSTRUCTIONS:
 1. DIARIZATION: Separate every speaker change into alternating turns between "Operator" (helpline agent) and "Caller" (person calling).
-2. NATIVE SCRIPT & CODE-SWITCHING: Transcribe "originalText" verbatim in the native script of the spoken language(s) (Hindi, Bengali, Tamil, Telugu, Marathi, Gujarati, Punjabi, English, Hinglish, etc.), preserving mid-sentence code-switching.
+2. NATIVE SCRIPT & CODE-SWITCHING: Transcribe "originalText" verbatim in the native script of the spoken language(s), preserving mid-sentence code-switching.
 3. TRANSLATION: Provide accurate English translation in "englishText" for every turn.
 
 OUTPUT STRICT JSON:
@@ -544,21 +806,41 @@ OUTPUT STRICT JSON:
 }
 `;
 
-    const { text } = await generateWithGeminiFallback({
-      models: [PRIMARY_MODEL, FALLBACK_MODEL],
-      contents: {
-        parts: [
-          { inlineData: { data: base64Data, mimeType: file.mimetype || 'audio/wav' } },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
-      },
-    });
+    let parsed: any = null;
+    let provider: 'gemini-3.8-flash' | 'groq-fallback' = 'gemini-3.8-flash';
 
-    const parsed = extractJsonFromText(text);
+    try {
+      const geminiRes = await callGeminiPrimary({
+        contents: {
+          parts: [
+            { inlineData: { data: base64Data, mimeType: file.mimetype || 'audio/wav' } },
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+        },
+      });
+      parsed = extractJsonFromText(geminiRes.text);
+      provider = 'gemini-3.8-flash';
+    } catch (geminiErr: any) {
+      if (!groqApiKey) {
+        throw geminiErr;
+      }
+      const whisper = await callGroqWhisper(fileBuffer, groqApiKey, file.mimetype || 'audio/wav');
+      if (whisper.isSilence) {
+        return res.json({ turns: [], language: whisper.language, speaker_count_detected: 0, provider: 'groq-fallback' });
+      }
+      const groqChat = await callGroqChatJson(
+        'You are a strict JSON diarization and translation engine.',
+        `${prompt}\n\nRaw Whisper Transcript (${whisper.language}):\n${whisper.text}`,
+        groqApiKey
+      );
+      parsed = extractJsonFromText(groqChat.text);
+      provider = 'groq-fallback';
+    }
+
     const rawTurns = Array.isArray(parsed)
       ? parsed
       : Array.isArray(parsed?.turns)
@@ -585,6 +867,7 @@ OUTPUT STRICT JSON:
     });
 
     return res.json({
+      provider,
       turns,
       language: parsed?.detectedLanguage || null,
       speaker_count_detected: new Set(turns.map((t: any) => t.speaker)).size,
@@ -618,7 +901,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT} (Gemini Native Audio Pipeline Active)`);
+    console.log(`Server running on http://0.0.0.0:${PORT} (Gemini 3.8 Flash + Groq Fallback Active)`);
   });
 }
 
